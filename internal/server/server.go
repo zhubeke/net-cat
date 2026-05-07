@@ -33,20 +33,26 @@ _)      \.___.,|     .'
      '-\       '--'
 [ENTER YOUR NAME]: `
 
+
+type Message struct {
+	text   string
+	sender *Client 
+}
+
 type Server struct {
-	clients      map[*Client]bool
-	mu           sync.Mutex
-	messages     []string
-	messageChan  chan string
-	joinChan     chan *Client
-	leaveChan    chan *Client
+	clients     map[*Client]bool
+	mu          sync.Mutex
+	messages    []string
+	messageChan chan Message
+	joinChan    chan *Client
+	leaveChan   chan *Client
 }
 
 func NewServer() *Server {
 	return &Server{
 		clients:     make(map[*Client]bool),
 		messages:    make([]string, 0),
-		messageChan: make(chan string),
+		messageChan: make(chan Message, 16), 
 		joinChan:    make(chan *Client),
 		leaveChan:   make(chan *Client),
 	}
@@ -61,10 +67,8 @@ func (s *Server) Start(port string) error {
 
 	fmt.Printf("Listening on the port :%s\n", port)
 
-	// Start broadcast goroutine
 	go s.broadcast()
 
-	// Accept connections
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -72,7 +76,6 @@ func (s *Server) Start(port string) error {
 			continue
 		}
 
-		// Check connection limit
 		s.mu.Lock()
 		if len(s.clients) >= maxConnections {
 			s.mu.Unlock()
@@ -82,16 +85,13 @@ func (s *Server) Start(port string) error {
 		}
 		s.mu.Unlock()
 
-		// Handle new client
 		go s.handleConnection(conn)
 	}
 }
 
 func (s *Server) handleConnection(conn net.Conn) {
-	// Send welcome banner
 	conn.Write([]byte(banner))
 
-	// Get client name
 	reader := bufio.NewReader(conn)
 	name, err := reader.ReadString('\n')
 	if err != nil {
@@ -106,7 +106,6 @@ func (s *Server) handleConnection(conn net.Conn) {
 		return
 	}
 
-	// Check for duplicate names
 	s.mu.Lock()
 	for client := range s.clients {
 		if client.GetName() == name {
@@ -118,50 +117,41 @@ func (s *Server) handleConnection(conn net.Conn) {
 	}
 	s.mu.Unlock()
 
-	// Create new client
 	client := NewClient(conn)
 	client.SetName(name)
 
-	// Send previous messages to new client
+	
 	s.mu.Lock()
 	for _, msg := range s.messages {
 		client.SendMessage(msg + "\n")
 	}
 	s.mu.Unlock()
 
-	// Add client to server
 	s.joinChan <- client
 
-	// Handle client messages
-	go s.handleClientMessages(client, reader)
+	s.handleClientMessages(client, reader)
 }
 
 func (s *Server) handleClientMessages(client *Client, reader *bufio.Reader) {
-	for {
-		message, err := reader.ReadString('\n')
-		if err != nil {
-			// Client disconnected
-			s.leaveChan <- client
-			return
-		}
-
-		message = strings.TrimSpace(message)
+	scanner := bufio.NewScanner(reader)
+	for scanner.Scan() {
+		message := strings.TrimSpace(scanner.Text())
 		if message == "" {
-			continue // Don't broadcast empty messages
+			client.sendPrompt()
+			continue
 		}
 
-		// Format message with timestamp and name
 		timestamp := time.Now().Format("2006-01-02 15:04:05")
 		formattedMsg := fmt.Sprintf("[%s][%s]:%s", timestamp, client.GetName(), message)
-		
-		// Store message history
+
 		s.mu.Lock()
 		s.messages = append(s.messages, formattedMsg)
 		s.mu.Unlock()
 
-		// Broadcast message
-		s.messageChan <- formattedMsg
+		s.messageChan <- Message{text: formattedMsg, sender: client}
 	}
+
+	s.leaveChan <- client
 }
 
 func (s *Server) broadcast() {
@@ -172,14 +162,14 @@ func (s *Server) broadcast() {
 			s.clients[client] = true
 			s.mu.Unlock()
 
-			// Notify other clients
 			joinMsg := fmt.Sprintf("%s has joined our chat...", client.GetName())
-			s.messageChan <- joinMsg
-			
-			// Add to history
 			s.mu.Lock()
 			s.messages = append(s.messages, joinMsg)
 			s.mu.Unlock()
+
+			go func(msg string, joiner *Client) {
+				s.messageChan <- Message{text: msg, sender: joiner}
+			}(joinMsg, client)
 
 		case client := <-s.leaveChan:
 			s.mu.Lock()
@@ -188,22 +178,30 @@ func (s *Server) broadcast() {
 			}
 			s.mu.Unlock()
 
-			// Notify other clients
 			leaveMsg := fmt.Sprintf("%s has left our chat...", client.GetName())
-			s.messageChan <- leaveMsg
-			
-			// Add to history
 			s.mu.Lock()
 			s.messages = append(s.messages, leaveMsg)
 			s.mu.Unlock()
-			
+
 			client.conn.Close()
 
-		case message := <-s.messageChan:
-			// Broadcast message to all clients
+			go func(msg string) {
+				s.messageChan <- Message{text: msg, sender: nil}
+			}(leaveMsg)
+
+		case msg := <-s.messageChan:
 			s.mu.Lock()
 			for client := range s.clients {
-				client.SendMessage("\n" + message + "\n")
+				if msg.sender == client {
+					client.sendPrompt()
+					continue
+				}
+				if err := client.SendMessage("\n" + msg.text + "\n"); err != nil {
+					delete(s.clients, client)
+					client.conn.Close()
+					continue
+				}
+				client.sendPrompt()
 			}
 			s.mu.Unlock()
 		}

@@ -1,10 +1,17 @@
 package server
 
 import (
+
+	"fmt"
 	"net"
 	"sync"
 	"time"
 )
+
+func (c *Client) sendPrompt() {
+    timestamp := time.Now().Format("2006-01-02 15:04:05")
+    c.conn.Write([]byte(fmt.Sprintf("[%s][%s]:", timestamp, c.GetName())))
+}
 
 type Client struct {
 	conn     net.Conn
@@ -32,9 +39,10 @@ func (c *Client) SetName(name string) {
 	c.name = name
 }
 
+
 func (c *Client) SendMessage(message string) error {
-	_, err := c.conn.Write([]byte(message))
-	return err
+    _, err := c.conn.Write([]byte(message))
+    return err
 }
 
 func (c *Client) GetAddress() string {
